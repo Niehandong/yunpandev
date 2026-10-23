@@ -8,24 +8,22 @@
     FILEZ_SLUG=jik462374
 已在系统环境变量中设置的同名变量优先于 .env。
 
-用法:
-    python3 filez_sync_env.py scan                    # 只遍历元数据写入 sqlite，不下载
-    python3 filez_sync_env.py scan --root /roky       # 只遍历某个目录（可写任意深度）
-    python3 filez_sync_env.py sync --root /roky/a/b --root /newy/c   # 多个目录
-    python3 filez_sync_env.py sync --out ./mirror     # 遍历 + 下载新增/变更文件
-    python3 filez_sync_env.py sync --limit 5          # 试跑：最多下载 5 个文件
-    python3 filez_sync_env.py sync --out ./mirror --root /激光器板块/连续光产品线/激光连续光品质部
-增量策略: 本地记录 neid -> rev，rev 变化才重新下载；本轮未出现的文件标记 deleted=1（不删本地文件）。
+用法（运行即完成扫描 + 下载）:
+    python3 filez_sync_env.py                                   # 扫描 / 并下载到 ./mirror
+    python3 filez_sync_env.py --out ./mirror --root /roky       # 指定下载目录和起始目录
+    python3 filez_sync_env.py --root /roky/a/b --root /newy/c   # 多个目录
+    python3 filez_sync_env.py --limit 5                         # 试跑：最多下载 5 个文件
+增量策略: 下载后把本地文件修改时间设为远端 modified；本地已存在且修改时间一致的文件跳过。
 """
 import argparse
 import base64
 import logging
 import os
-import sqlite3
 import sys
 import threading
 import time
 from collections import deque
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
 
@@ -140,17 +138,17 @@ class FilezClient:
         """按 neid 下载到 dest（先写 .part 再原子重命名）。"""
         r = self.request("GET", "/file/content/download",
                          params={"neid": neid, "nsid": nsid}, stream=True)
-        ctype = r.headers.get("Content-Type", "")
-        if r.status_code != 200 or ctype.startswith("application/json"):
-            body = r.text[:300]
-            raise FilezError(f"下载 neid={neid} 失败: {r.status_code} {body}")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_name(dest.name + ".part")
-        size = 0
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(1 << 20):
-                f.write(chunk)
-                size += len(chunk)
+        with r:
+            ctype = r.headers.get("Content-Type", "")
+            if r.status_code != 200 or ctype.startswith("application/json"):
+                raise FilezError(f"下载 neid={neid} 失败: {r.status_code} {r.text[:300]}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_name(dest.name + ".part")
+            size = 0
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(1 << 20):
+                    f.write(chunk)
+                    size += len(chunk)
         os.replace(tmp, dest)
         return size
 
@@ -181,50 +179,7 @@ def load_config(env_file: Path):
     return cfg
 
 
-# ---------- 本地元数据库 ----------
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS files (
-    neid           TEXT PRIMARY KEY,
-    nsid           TEXT NOT NULL,
-    path           TEXT NOT NULL,
-    is_dir         INTEGER NOT NULL,
-    is_team        INTEGER NOT NULL,
-    rev            TEXT,
-    size_str       TEXT,
-    modified       TEXT,
-    creator        TEXT,
-    updator        TEXT,
-    downloaded_rev TEXT,
-    local_path     TEXT,
-    deleted        INTEGER NOT NULL DEFAULT 0,
-    last_seen      INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
-"""
-
-
-def open_db(path):
-    db = sqlite3.connect(path)
-    db.executescript(SCHEMA)
-    return db
-
-
-def upsert(db, it, run_id):
-    db.execute(
-        """INSERT INTO files (neid, nsid, path, is_dir, is_team, rev, size_str, modified,
-                              creator, updator, deleted, last_seen)
-           VALUES (?,?,?,?,?,?,?,?,?,?,0,?)
-           ON CONFLICT(neid) DO UPDATE SET
-               nsid=excluded.nsid, path=excluded.path, is_dir=excluded.is_dir,
-               is_team=excluded.is_team, rev=excluded.rev, size_str=excluded.size_str,
-               modified=excluded.modified, creator=excluded.creator, updator=excluded.updator,
-               deleted=0, last_seen=excluded.last_seen""",
-        (str(it["neid"]), str(it["nsid"]), it["path"], int(bool(it.get("dir"))),
-         int(bool(it.get("isTeam"))), it.get("rev") or "", it.get("size"), it.get("modified"),
-         it.get("creator"), it.get("updator"), run_id),
-    )
-
-
+# ---------- 本地路径与修改时间 ----------
 def safe_local_path(out_dir: Path, remote_path: str) -> Path:
     parts = [p for p in PurePosixPath(remote_path).parts if p not in ("/", "", ".")]
     if any(p == ".." for p in parts):
@@ -232,10 +187,24 @@ def safe_local_path(out_dir: Path, remote_path: str) -> Path:
     return out_dir.joinpath(*parts)
 
 
+def remote_mtime(it):
+    """把远端 modified（如 2021-08-13 14:37:51）转成时间戳，解析失败返回 None。"""
+    try:
+        return datetime.strptime(it.get("modified") or "", "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        return None
+
+
+def is_up_to_date(dest: Path, mtime):
+    return mtime is not None and dest.is_file() and int(dest.stat().st_mtime) == int(mtime)
+
+
 # ---------- 遍历 ----------
-def scan(client, db, root, run_id):
+def scan(client, root):
+    """遍历 root 下所有目录，返回文件条目列表。"""
     queue = deque([root])
-    n_dir = n_file = 0
+    files = []
+    n_dir = 0
     while queue:
         d = queue.popleft()
         try:
@@ -244,69 +213,57 @@ def scan(client, db, root, run_id):
             log.error("列目录 %s 失败: %s", d, e)
             continue
         for it in items:
-            upsert(db, it, run_id)
             if it.get("dir"):
                 n_dir += 1
                 queue.append(it["path"])
             else:
-                n_file += 1
-        db.commit()
-        log.info("已扫描 %s（目录 %d，文件 %d，待扫描 %d）", d, n_dir, n_file, len(queue))
-
-    # 本轮 root 下没再出现的条目 -> 标记删除
-    prefix = root.rstrip("/") + "/"
-    cur = db.execute(
-        "UPDATE files SET deleted=1 WHERE last_seen<>? AND deleted=0 AND (path=? OR path LIKE ?)",
-        (run_id, root, prefix + "%"))
-    db.commit()
-    log.info("扫描完成：目录 %d，文件 %d，新标记删除 %d", n_dir, n_file, cur.rowcount)
+                files.append(it)
+        log.info("已扫描 %s（目录 %d，文件 %d，待扫描 %d）", d, n_dir, len(files), len(queue))
+    log.info("扫描完成 %s：目录 %d，文件 %d", root, n_dir, len(files))
+    return files
 
 
-def sync_files(client, db, out_dir: Path, root, workers, limit):
-    prefix = root.rstrip("/") + "/"
-    rows = db.execute(
-        """SELECT neid, nsid, path, rev FROM files
-           WHERE is_dir=0 AND deleted=0 AND (downloaded_rev IS NULL OR downloaded_rev<>rev)
-             AND (path=? OR path LIKE ?)
-           ORDER BY path""", (root, prefix + "%")).fetchall()
+def sync_files(client, files, out_dir: Path, workers, limit):
+    todo = []
+    for it in files:
+        dest = safe_local_path(out_dir, it["path"])
+        mtime = remote_mtime(it)
+        if not is_up_to_date(dest, mtime):
+            todo.append((it, dest, mtime))
+    skipped = len(files) - len(todo)
     if limit:
-        rows = rows[:limit]
-    log.info("待下载 %d 个文件", len(rows))
+        todo = todo[:limit]
+    log.info("共 %d 个文件，跳过未变化 %d 个，待下载 %d 个", len(files), skipped, len(todo))
 
-    def job(row):
-        neid, nsid, path, rev = row
-        dest = safe_local_path(out_dir, path)
-        size = client.download(neid, nsid, dest)
-        return neid, rev, str(dest), size
+    def job(it, dest, mtime):
+        size = client.download(str(it["neid"]), str(it["nsid"]), dest)
+        if mtime is not None:
+            os.utime(dest, (mtime, mtime))
+        return size
 
     ok = fail = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(job, r): r for r in rows}
+        futs = {pool.submit(job, *t): t[0]["path"] for t in todo}
         for fut in as_completed(futs):
-            neid, _, path, _ = futs[fut]
+            path = futs[fut]
             try:
-                neid, rev, local, size = fut.result()
+                size = fut.result()
             except Exception as e:  # noqa: BLE001 单个文件失败不影响整体
                 fail += 1
                 log.error("下载失败 %s: %s", path, e)
                 continue
-            db.execute("UPDATE files SET downloaded_rev=?, local_path=? WHERE neid=?",
-                       (rev, local, neid))
-            db.commit()
             ok += 1
-            log.info("[%d/%d] %s (%d bytes)", ok + fail, len(rows), path, size)
+            log.info("[%d/%d] %s (%d bytes)", ok + fail, len(todo), path, size)
     log.info("下载完成：成功 %d，失败 %d", ok, fail)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Filez 企业空间文档同步")
-    ap.add_argument("mode", choices=["scan", "sync"])
+    ap = argparse.ArgumentParser(description="Filez 企业空间文档同步（扫描 + 下载）")
     ap.add_argument("--root", action="append", dest="roots",
                     help="企业空间起始路径，可写多次；默认 /")
+    ap.add_argument("--out", default="mirror", help="下载目录，默认 ./mirror")
     ap.add_argument("--env", default=str(Path(__file__).resolve().parent / ".env"),
                     help="配置文件路径，默认脚本同目录下的 .env")
-    ap.add_argument("--db", default="filez_meta.db")
-    ap.add_argument("--out", default="mirror", help="下载目录")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--limit", type=int, default=0, help="最多下载多少个文件（试跑用）")
     args = ap.parse_args()
@@ -316,16 +273,14 @@ def main():
     cfg = load_config(Path(args.env))
     client = FilezClient(cfg["FILEZ_BASE"], cfg["FILEZ_APP_KEY"],
                          cfg["FILEZ_APP_SECRET"], cfg["FILEZ_SLUG"])
-    db = open_db(args.db)
-    run_id = int(time.time())
 
-    # 统一去掉末尾 /（根目录除外），保证前缀匹配一致
+    # 统一去掉末尾 /（根目录除外）；多个 root 有重叠时按 neid 去重
     roots = [r.rstrip("/") or "/" for r in (args.roots or ["/"])]
+    files = {}
     for root in roots:
-        scan(client, db, root, run_id)
-    if args.mode == "sync":
-        for root in roots:
-            sync_files(client, db, Path(args.out), root, args.workers, args.limit)
+        for it in scan(client, root):
+            files[str(it["neid"])] = it
+    sync_files(client, list(files.values()), Path(args.out), args.workers, args.limit)
 
 
 if __name__ == "__main__":

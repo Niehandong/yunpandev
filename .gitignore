@@ -1,0 +1,21 @@
+# 密钥配置，只提交 .env.example
+.env
+!.env.example
+
+# 同步下载目录及临时文件
+mirror/
+*.part
+
+# 旧版本的 sqlite 元数据库
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
