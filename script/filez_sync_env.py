@@ -41,8 +41,43 @@ class FilezError(Exception):
     pass
 
 
+class RateLimiter:
+    """滑动窗口限速：任意 period 秒内最多 limit 次，线程安全，超出时阻塞等待。"""
+
+    def __init__(self, limit, period=60.0):
+        self.limit = limit
+        self.period = period
+        self._stamps = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._stamps and now - self._stamps[0] >= self.period:
+                    self._stamps.popleft()
+                if len(self._stamps) < self.limit:
+                    self._stamps.append(now)
+                    return
+                wait = self.period - (now - self._stamps[0])
+            time.sleep(max(wait, 0.05))
+
+
+def rate_limit_wait(r):
+    """服务端限速响应（403 且 reason.type=rate）返回需等待的秒数，否则返回 None。"""
+    if r.status_code not in (403, 429):
+        return None
+    try:
+        reason = r.json().get("reason") or {}
+    except ValueError:
+        return None
+    if reason.get("type") != "rate":
+        return None
+    return int(reason.get("seconds") or 60)
+
+
 class FilezClient:
-    def __init__(self, base, app_key, app_secret, slug, timeout=60):
+    def __init__(self, base, app_key, app_secret, slug, timeout=60, rate=90):
         self.base = base.rstrip("/")
         self.slug = slug
         self.timeout = timeout
@@ -51,6 +86,9 @@ class FilezClient:
         self._token_exp = 0.0
         self._lock = threading.Lock()
         self.session = requests.Session()
+        # 服务端按应用、按接口限速：fileList / fileDownload 各自每 60s 100 次，客户端主动留余量
+        self.list_limiter = RateLimiter(rate, 60)
+        self.download_limiter = RateLimiter(rate, 60)
 
     # ---------- token ----------
     def _fetch_token(self):
@@ -74,11 +112,14 @@ class FilezClient:
                 self._fetch_token()
             return self._token
 
-    # ---------- 通用请求：401/invalid_token 自动刷新，5xx/429/网络错误退避重试 ----------
-    def request(self, method, path, retries=4, stream=False, **kw):
+    # ---------- 通用请求：401/invalid_token 自动刷新，限速等待，5xx/429/网络错误退避重试 ----------
+    def request(self, method, path, retries=4, stream=False, limiter=None, rate_retries=10, **kw):
         url = f"{self.base}/{API_VER}/api{path}"
         refreshed = False
-        for attempt in range(retries + 1):
+        attempt = 0
+        while attempt <= retries:
+            if limiter:
+                limiter.acquire()
             headers = {"Authorization": f"bearer {self.token()}"}
             try:
                 r = self.session.request(method, url, headers=headers, timeout=self.timeout,
@@ -89,21 +130,35 @@ class FilezClient:
                 wait = 2 ** attempt
                 log.warning("%s %s 网络错误 %s，%ss 后重试", method, path, e, wait)
                 time.sleep(wait)
+                attempt += 1
+                continue
+
+            wait = rate_limit_wait(r)
+            if wait is not None:
+                r.close()
+                if rate_retries <= 0:
+                    raise FilezError(f"{method} {path} 持续被限速: {r.status_code} {r.text[:300]}")
+                rate_retries -= 1
+                log.warning("%s %s 被服务端限速，%ss 后重试", method, path, wait)
+                time.sleep(wait)
                 continue
 
             if r.status_code == 401 or (r.status_code == 400 and "invalid_token" in r.text[:500]):
                 if refreshed:
                     raise FilezError(f"鉴权失败: {r.status_code} {r.text[:300]}")
                 log.info("token 失效，重新获取")
+                r.close()
                 self.token(force=True)
                 refreshed = True
                 continue
             if r.status_code == 429 or r.status_code >= 500:
                 if attempt == retries:
                     raise FilezError(f"{method} {path} 失败: {r.status_code} {r.text[:300]}")
+                r.close()
                 wait = 2 ** attempt
                 log.warning("%s %s -> %s，%ss 后重试", method, path, r.status_code, wait)
                 time.sleep(wait)
+                attempt += 1
                 continue
             return r
         raise FilezError(f"{method} {path} 重试耗尽")
@@ -123,7 +178,7 @@ class FilezClient:
         """分页列出目录下全部条目。"""
         items, page = [], 0
         while True:
-            j = self.api_json("POST", "/file", data={
+            j = self.api_json("POST", "/file", limiter=self.list_limiter, data={
                 "path": path, "path_type": path_type, "page_num": page,
                 "page_size": PAGE_SIZE, "order_by": "name", "sort": "asc",
             })
@@ -137,7 +192,8 @@ class FilezClient:
     def download(self, neid, nsid, dest: Path):
         """按 neid 下载到 dest（先写 .part 再原子重命名）。"""
         r = self.request("GET", "/file/content/download",
-                         params={"neid": neid, "nsid": nsid}, stream=True)
+                         params={"neid": neid, "nsid": nsid}, stream=True,
+                         limiter=self.download_limiter)
         with r:
             ctype = r.headers.get("Content-Type", "")
             if r.status_code != 200 or ctype.startswith("application/json"):
@@ -297,13 +353,15 @@ def main():
                     help="配置文件路径，默认脚本同目录下的 .env")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--limit", type=int, default=0, help="最多下载多少个文件（试跑用）")
+    ap.add_argument("--rate", type=int, default=90,
+                    help="列目录、下载接口各自每 60 秒最多请求多少次，默认 90（服务端上限 100）")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     cfg = load_config(Path(args.env))
     client = FilezClient(cfg["FILEZ_BASE"], cfg["FILEZ_APP_KEY"],
-                         cfg["FILEZ_APP_SECRET"], cfg["FILEZ_SLUG"])
+                         cfg["FILEZ_APP_SECRET"], cfg["FILEZ_SLUG"], rate=args.rate)
 
     # 多个 root 有重叠时按 neid 去重
     roots = [normalize_root(r) for r in (args.roots or ["/"])]
