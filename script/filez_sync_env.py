@@ -200,6 +200,35 @@ def is_up_to_date(dest: Path, mtime):
 
 
 # ---------- 遍历 ----------
+ENT_ROOT_LABEL = "/企业空间"  # 网页上显示的根节点名，接口路径里不包含它
+
+
+def normalize_root(root):
+    """去掉末尾 /（根目录除外），并去掉从网页复制路径时带上的 /企业空间 前缀。"""
+    root = root.rstrip("/") or "/"
+    if root == ENT_ROOT_LABEL or root.startswith(ENT_ROOT_LABEL + "/"):
+        root = root[len(ENT_ROOT_LABEL):] or "/"
+        log.info("已去掉路径中的 %s 前缀，实际查询 %s", ENT_ROOT_LABEL, root)
+    return root
+
+
+def diagnose_root(client, root):
+    """起始目录列不出来时，从 / 逐级往下核对，指出哪一级不存在及该级实际有哪些子目录。"""
+    cur = "/"
+    for name in PurePosixPath(root).parts[1:]:
+        try:
+            items = client.list_dir(cur)
+        except FilezError as e:
+            log.error("诊断：列目录 %s 也失败: %s", cur, e)
+            return
+        dirs = [PurePosixPath(it["path"]).name for it in items if it.get("dir")]
+        if name not in dirs:
+            log.error("诊断：%s 下没有目录「%s」，现有子目录（前 50 个）: %s", cur, name, dirs[:50])
+            return
+        cur = str(PurePosixPath(cur) / name)
+    log.error("诊断：逐级核对 %s 均存在，可能是当前账号对该目录没有权限", root)
+
+
 def scan(client, root):
     """遍历 root 下所有目录，返回文件条目列表。"""
     queue = deque([root])
@@ -211,6 +240,8 @@ def scan(client, root):
             items = client.list_dir(d)
         except FilezError as e:
             log.error("列目录 %s 失败: %s", d, e)
+            if d == root and root != "/":
+                diagnose_root(client, root)
             continue
         for it in items:
             if it.get("dir"):
@@ -274,8 +305,8 @@ def main():
     client = FilezClient(cfg["FILEZ_BASE"], cfg["FILEZ_APP_KEY"],
                          cfg["FILEZ_APP_SECRET"], cfg["FILEZ_SLUG"])
 
-    # 统一去掉末尾 /（根目录除外）；多个 root 有重叠时按 neid 去重
-    roots = [r.rstrip("/") or "/" for r in (args.roots or ["/"])]
+    # 多个 root 有重叠时按 neid 去重
+    roots = [normalize_root(r) for r in (args.roots or ["/"])]
     files = {}
     for root in roots:
         for it in scan(client, root):
